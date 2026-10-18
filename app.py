@@ -58,7 +58,7 @@ def clean_sql(text):
 def generate_sql(question, schema, previous_sql=None, error=None):
     """Ask Ollama for a single read-only SQLite query."""
     print("RETRY DEBUG - Previous SQL:", previous_sql)
-    print("RETRY DEBUG - Previous error:", re.error)
+    print("RETRY DEBUG - Previous error:", error)
     print("RETRY DEBUG - Error type:", type(error).__name__)
     correction = ""
     if previous_sql and error:
@@ -104,8 +104,13 @@ Revenue and sales:
 - If asked for both revenue and units sold, return both metrics with
   aliases total_revenue and total_units_sold.
 - Do not confuse revenue, units sold, and number of orders.
-- For revenue calculations, always use oi.unit_price from order_items.
-  Never use p.price from products for sales revenue.
+- For revenue calculations, use the order_items table with alias oi.
+- Calculate revenue as SUM(oi.quantity * oi.unit_price).
+- Calculate units sold as SUM(oi.quantity).
+- If order_items is aliased as oi, never use order_items.quantity
+  or order_items.unit_price elsewhere in the query.
+- Join products only when product names or other product fields are needed.
+- Do not join orders or customers unless the question requires their data.
 
 Sorting and prices:
 - If the user asks about prices, include the product name and price.
@@ -121,6 +126,8 @@ Sorting and prices:
 Filters and table aliases:
 - Only apply filters explicitly requested by the user.
 - Do not add unrelated filters or joins.
+- When a table has an alias, always use that alias to reference its columns.
+- Never use a table's original name to reference its columns after aliasing it.
 - When using a table alias, reference that table's columns consistently
   through the alias throughout the query.
 - Use only valid SQLite syntax.
@@ -335,8 +342,9 @@ def classify_question(question, schema):
     return "IN_SCOPE"
 
 
+
 def validate_business_rules(sql, question):
-    """Validate common sales-query mistakes before execution."""
+    """Validate the revenue formula for sales-related questions."""
     import re
 
     q = question.lower()
@@ -353,53 +361,28 @@ def validate_business_rules(sql, question):
         )
     )
 
-    units_question = any(
-        term in q
-        for term in ("units sold", "how many units", "number of units")
-    )
-
     if not revenue_question:
         return
 
-    # If products has an alias, do not use products.price
-    # to calculate historical sales revenue.
+    # Detect quantity multiplied by price inside SUM().
     wrong_price_formula = re.search(
-        r"\bsum\s*\(\s*"
-        r"(?:\w+\.)?quantity\s*\*\s*(?:\w+\.)?price\s*\)",
+        r"\bsum\s*\(\s*(?:\w+\.)?quantity\s*\*\s*(?:\w+\.)?price\s*\)",
         s,
     )
 
     if wrong_price_formula:
-        # Permit only the recorded order-item sale price.
+        # Check whether the query also contains the correct formula.
         correct_formula = re.search(
-            r"\bsum\s*\(\s*"
-            r"(?:\w+\.)?quantity\s*\*\s*(?:\w+\.)?unit_price\s*\)",
+            r"\bsum\s*\(\s*(?:\w+\.)?quantity\s*\*\s*(?:\w+\.)?unit_price\s*\)",
             s,
         )
+
         if not correct_formula:
             raise ValueError(
                 "Revenue must be calculated using quantity * unit_price "
                 "from order_items, not quantity * price."
             )
 
-    if units_question:
-        if "total_units_sold" not in s:
-            raise ValueError(
-                "The question asks for units sold; include "
-                "SUM(order_items.quantity) AS total_units_sold."
-            )
-
-        if "total_revenue" not in s:
-            raise ValueError(
-                "The question asks for revenue and units sold; include "
-                "the total_revenue calculation in the returned columns."
-            )
-
-        if not re.search(r"\border by\s+total_revenue\s+desc\b", s):
-            raise ValueError(
-                "The question asks for the highest revenue; rank results "
-                "using ORDER BY total_revenue DESC."
-            )
 
 
 if run_button:
