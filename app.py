@@ -86,16 +86,23 @@ Rules:
 - Do not invent columns.
 - Always return the columns needed to answer the user's question.
 - Return only columns relevant to the user's question.
+- Prefer simple SELECT queries with straightforward JOIN, GROUP BY,
+  ORDER BY, and LIMIT clauses. Avoid subqueries unless necessary.
+- When a table has an alias, always use that alias to reference its columns.
+- Never use a table's original name to reference its columns after aliasing it.
 
 Revenue and sales:
 - Total revenue for a product is SUM(order_items.quantity * order_items.unit_price).
 - Total units sold is SUM(order_items.quantity).
+- Calculate historical sales revenue using SUM(order_items.quantity * order_items.unit_price).
 - Never substitute products.price for order_items.unit_price when
   calculating historical sales revenue.
 - If asked for highest total revenue, sort by total_revenue DESC.
 - If asked for both revenue and units sold, return both metrics with
   aliases total_revenue and total_units_sold.
 - Do not confuse revenue, units sold, and number of orders.
+- For revenue calculations, always use oi.unit_price from order_items.
+  Never use p.price from products for sales revenue.
 
 Sorting and prices:
 - If the user asks about prices, include the product name and price.
@@ -103,6 +110,10 @@ Sorting and prices:
   being compared and sort in the correct direction.
 - If the user asks for a ranking, return both the item name and its
   ranking value.
+  - For questions asking for the highest-revenue product and units sold,
+  return product name, total_revenue, and total_units_sold in the
+  outer SELECT. Calculate revenue as SUM(oi.quantity * oi.unit_price),
+  calculate units as SUM(oi.quantity), and order by total_revenue DESC.
 
 Filters and table aliases:
 - Only apply filters explicitly requested by the user.
@@ -144,7 +155,7 @@ User question:
         ],
         options={
             "temperature": 0,
-            "num_predict": 128,
+            "num_predict": 256,
         },
         keep_alive="10m",
     )
@@ -202,45 +213,70 @@ def validate_and_run_sql(sql):
         rows = cursor.fetchmany(200)
         return pd.DataFrame(rows, columns=columns)
 
+
 def summarize_results(question, sql, dataframe):
-    """Ask the model to describe retrieved rows without adding unsupported facts."""
+    """Create a concise answer using the exact database results."""
+    if dataframe.empty:
+        return "I couldn't find any records matching your question."
+
+    columns = dataframe.columns.tolist()
+    question_lower = question.lower()
+
+    # Highest-revenue product with units sold
+    if (
+        "product_name" in columns
+        and "total_revenue" in columns
+        and "total_units_sold" in columns
+        and len(dataframe) > 0
+    ):
+        row = dataframe.iloc[0]
+        product = row["product_name"]
+        revenue = row["total_revenue"]
+        units = row["total_units_sold"]
+
+        return (
+            f"{product} generated the highest total revenue, "
+            f"with {revenue:,.2f} in sales from {int(units)} units sold."
+        )
+
+    # Single numeric result, such as an average or count
+    if len(dataframe.columns) == 1 and len(dataframe) == 1:
+        column = dataframe.columns[0]
+        value = dataframe.iloc[0, 0]
+        q = question.lower()
+
+        if "customer" in q and ("how many" in q or "count" in q):
+            return f"There are {int(value)} customers matching your criteria."
+
+        return f"The result is {value}."
+
+    # General fallback: use the model for other questions
     records = dataframe.head(50).to_dict(orient="records")
     prompt = f"""
-Answer the user's question using only the SQL result below.
-Do not invent numbers or facts. If there are no rows, say no matching records were found.
-Be concise.
-Show only information relevant to the user's question.
-Do not mention technical column names such as signup_date unless relevant.
-Do not include dates or other details that the user did not ask for.
-Do not repeat database field names in the answer.
-Preserve customer names exactly as provided in the results.
-If the user asks to list customers, present a simple numbered list of names.
-If the user asks for a count, state the count clearly.
-- Never confuse revenue with units sold, order counts, or other metrics.
-- Preserve the meaning and units of every result column.
-- If a result has total_revenue and total_units_sold, report the
-  revenue as a monetary amount and units_sold as a number of units.
-- Do not describe a revenue value as units sold.
+Answer the user's question using only the SQL results below.
+Be concise and natural. Do not invent or change numbers.
+Show only information relevant to the question.
+Preserve names exactly as provided.
+
 Question:
 {question}
 
-SQL:
-{sql}
-
-Result rows (up to 50):
+SQL results:
 {json.dumps(records, ensure_ascii=False, default=str)}
-
-Rows displayed: {len(dataframe)}
 """
     response = ollama.chat(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": "Explain database results accurately; do not invent facts."},
+            {
+                "role": "system",
+                "content": "Explain database results accurately and naturally.",
+            },
             {"role": "user", "content": prompt},
         ],
-        options={"temperature": 0.2},
+        options={"temperature": 0},
     )
     return response["message"]["content"].strip()
+
 
 try:
     schema, table_names = get_schema()
@@ -295,7 +331,78 @@ def classify_question(question, schema):
 
     return "IN_SCOPE"
 
+
+def validate_business_rules(sql, question):
+    """Validate common sales-query mistakes before execution."""
+    import re
+
+    q = question.lower()
+    s = sql.lower()
+
+    revenue_question = any(
+        term in q
+        for term in (
+            "revenue",
+            "sales value",
+            "total sales",
+            "highest sales",
+            "most sales",
+        )
+    )
+
+    units_question = any(
+        term in q
+        for term in ("units sold", "how many units", "number of units")
+    )
+
+    if not revenue_question:
+        return
+
+    # If products has an alias, do not use products.price
+    # to calculate historical sales revenue.
+    wrong_price_formula = re.search(
+        r"\bsum\s*\(\s*"
+        r"(?:\w+\.)?quantity\s*\*\s*(?:\w+\.)?price\s*\)",
+        s,
+    )
+
+    if wrong_price_formula:
+        # Permit only the recorded order-item sale price.
+        correct_formula = re.search(
+            r"\bsum\s*\(\s*"
+            r"(?:\w+\.)?quantity\s*\*\s*(?:\w+\.)?unit_price\s*\)",
+            s,
+        )
+        if not correct_formula:
+            raise ValueError(
+                "Revenue must be calculated using quantity * unit_price "
+                "from order_items, not quantity * price."
+            )
+
+    if units_question:
+        if "total_units_sold" not in s:
+            raise ValueError(
+                "The question asks for units sold; include "
+                "SUM(order_items.quantity) AS total_units_sold."
+            )
+
+        if "total_revenue" not in s:
+            raise ValueError(
+                "The question asks for revenue and units sold; include "
+                "the total_revenue calculation in the returned columns."
+            )
+
+        if not re.search(r"\border by\s+total_revenue\s+desc\b", s):
+            raise ValueError(
+                "The question asks for the highest revenue; rank results "
+                "using ORDER BY total_revenue DESC."
+            )
+
+
 if run_button:
+    total_start = time.perf_counter()
+    scope_start = time.perf_counter()
+    
     with st.spinner("Checking your question..."):
         try:
             scope = classify_question(question, schema)
@@ -307,6 +414,7 @@ if run_button:
             )
 
     if scope == "OUT_OF_SCOPE":
+        print(f"Scope classification took {time.perf_counter() - scope_start:.2f} seconds")
         st.info(
             "I can answer questions about products, prices, customers, "
             "countries, orders, and sales in the database. "
@@ -327,7 +435,10 @@ if run_button:
                         previous_sql=current_sql if attempt > 0 else None,
                         error=last_error if attempt > 0 else None,
                     )
+                    validate_business_rules(current_sql, question)
+                    db_start = time.perf_counter()
                     result_df = validate_and_run_sql(current_sql)
+                    print(f"Database execution took {time.perf_counter() - db_start:.2f} seconds")
                     attempt_log.append(
                         f"Attempt {attempt + 1}: query succeeded."
                     )
@@ -359,12 +470,17 @@ if run_button:
 
             else:
                 try:
+                    answer_start = time.perf_counter()
+
                     with st.spinner("Generating natural-language answer..."):
                         answer = summarize_results(
                             question=question,
                             sql=current_sql,
                             dataframe=result_df,
                         )
+
+                    print(f"Answer generation took {time.perf_counter() - answer_start:.2f} seconds")
+                    print(f"Total response time: {time.perf_counter() - total_start:.2f} seconds")
 
                     st.write(answer)
 
@@ -381,7 +497,7 @@ if run_button:
             st.subheader("Retrieved data")
             st.dataframe(
                 result_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
