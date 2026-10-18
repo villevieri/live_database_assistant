@@ -57,9 +57,6 @@ def clean_sql(text):
 
 def generate_sql(question, schema, previous_sql=None, error=None):
     """Ask Ollama for a single read-only SQLite query."""
-    print("RETRY DEBUG - Previous SQL:", previous_sql)
-    print("RETRY DEBUG - Previous error:", error)
-    print("RETRY DEBUG - Error type:", type(error).__name__)
     correction = ""
     if previous_sql and error:
         correction = f"""
@@ -122,6 +119,18 @@ Sorting and prices:
   return product name, total_revenue, and total_units_sold in the
   outer SELECT. Calculate revenue as SUM(oi.quantity * oi.unit_price),
   calculate units as SUM(oi.quantity), and order by total_revenue DESC.
+- For questions about the cheapest or most expensive products,
+  use products.price to sort products.
+- "Lowest price" or "cheapest" means ORDER BY price ASC.
+- "Highest price" or "most expensive" means ORDER BY price DESC.
+- Do not join other tables unless the question requires information
+  from those tables.
+- The relationship between orders and products is through order_items:
+  orders.id = order_items.order_id and
+  products.id = order_items.product_id.
+- Never join orders directly to products using product_id,
+  because orders has no product_id column.
+- Preserve the requested sorting order in the final answer.
 
 Filters and table aliases:
 - Only apply filters explicitly requested by the user.
@@ -143,6 +152,18 @@ Customers and countries:
   signup dates, or customer history.
 - Include customer IDs only when requested or needed to distinguish
   customers with otherwise identical names.
+- Customer names may contain a first name followed by a space and a
+  numeric suffix, such as 'Bob 4' or 'Jack 5'.
+- When a question asks how many customers have a given first name,
+  count all matching customer records whose names begin with that
+  first name followed by a space.
+- Generate the filter dynamically from the name in the user's question.
+  Never hardcode specific names.
+- Use a parameter-free SQL LIKE pattern such as
+  name LIKE 'Bob %', replacing Bob with the requested name.
+- If the user provides a complete customer name including its number,
+  use an exact match instead.
+
 
 User question:
 {question}
@@ -263,10 +284,16 @@ def summarize_results(question, sql, dataframe):
     # General fallback: use the model for other questions
     records = dataframe.head(50).to_dict(orient="records")
     prompt = f"""
-Answer the user's question using only the SQL results below.
-Be concise and natural. Do not invent or change numbers.
-Show only information relevant to the question.
-Preserve names exactly as provided.
+- When displaying country codes, use full country names where the
+  mapping is known: DE = Germany, FI = Finland, FR = France,
+  SE = Sweden, UK = United Kingdom, US = United States.
+- Answer the user's question using only the SQL results below.
+- Be concise and natural. Do not invent or change numbers.
+- Show only information relevant to the question.
+- Preserve names exactly as provided.
+- Preserve the exact row order from the SQL results.
+- Never reorder, sort, or rank the returned records yourself.
+- When listing results, present them in the same order as provided.
 
 Question:
 {question}
@@ -309,20 +336,35 @@ run_button = st.button("Ask the AI assistant", type="primary", disabled=not ques
 with st.expander("Database schema"):
     st.code(schema, language="text")
 
+
 def classify_question(question, schema):
     """Check whether the question can be answered using the database."""
+    print(f"Question: {question}")
+
     response = ollama.chat(
         model=MODEL_NAME,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Determine whether a question can be answered using "
-                    "the provided database schema. "
-                    "Questions about products, prices, customers, countries, "
-                    "orders, and sales are in scope if the schema supports them. "
-                    "Questions about unrelated external information, such as "
-                    "weather, are out of scope. "
+                    "Determine whether the user's question can be answered "
+                    "using the provided database schema.\n"
+                    "\n"
+                    "Return IN_SCOPE for questions about information stored "
+                    "in the database, including counting, filtering, comparing, "
+                    "sorting, and aggregating customers, customer names, countries, "
+                    "products, prices, orders, and sales.\n"
+                    "\n"
+                    "Examples of IN_SCOPE questions:\n"
+                    "- How many customers do we have?\n"
+                    "- How many customers named Bob do we have?\n"
+                    "- Which country has the most customers?\n"
+                    "- Which product generated the highest revenue?\n"
+                    "\n"
+                    "Return OUT_OF_SCOPE only when the question requires information "
+                    "that cannot be answered from the database, such as current weather "
+                    "or unrelated external facts.\n"
+                    "\n"
                     "Return exactly IN_SCOPE or OUT_OF_SCOPE."
                 ),
             },
@@ -335,11 +377,14 @@ def classify_question(question, schema):
     )
 
     result = response["message"]["content"].strip().upper()
+    print(f"Scope classification result: {result}")
+    print(f"Original question: {question}")
 
     if result.startswith("OUT_OF_SCOPE"):
         return "OUT_OF_SCOPE"
 
     return "IN_SCOPE"
+
 
 
 
@@ -399,15 +444,19 @@ if run_button:
                 f"Details: {exc}"
             )
 
+    print(
+        f"Scope classification took "
+        f"{time.perf_counter() - scope_start:.2f} seconds"
+    )
+
     if scope == "OUT_OF_SCOPE":
-        print(f"Scope classification took {time.perf_counter() - scope_start:.2f} seconds")
         st.info(
             "I can answer questions about products, prices, customers, "
             "countries, orders, and sales in the database. "
             "I don't have access to live weather information or other "
             "external data."
         )
-
+        st.stop()
     else:
         with st.spinner("Generating SQL and querying the database..."):
             
@@ -441,9 +490,6 @@ if run_button:
 
                 except Exception as exc:
                     last_error = str(exc)
-                    print("EXCEPTION TYPE:", type(exc).__name__)
-                    print("EXCEPTION MESSAGE:", repr(str(exc)))
-                    print("LAST_ERROR TYPE:", type(last_error).__name__)
                     attempt_log.append({
                         "attempt": attempt + 1,
                         "sql": attempt_sql or "(SQL generation failed)",
