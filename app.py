@@ -15,7 +15,7 @@ MAX_RETRIES = 2
 
 st.set_page_config(page_title="Live Database Assistant", page_icon="🗃️", layout="wide")
 st.title("🗃️ Live Database Information Assistant")
-st.caption("Milestone 2 — local AI generates SQL, retrieves database evidence, and retries failed queries.")
+st.caption("Local AI generates SQL, retrieves database evidence, and retries failed queries.")
 
 def connect_db():
     """Open SQLite in read-only mode."""
@@ -245,6 +245,82 @@ def validate_and_run_sql(sql):
         return pd.DataFrame(rows, columns=columns)
 
 
+def get_clarification_options(question):
+    """Return clarification options for recognized vague questions."""
+    q = question.lower().strip().rstrip("?!.")
+
+    vague_product_phrases = [
+        "which products are doing best",
+        "which product is doing best",
+        "which products perform best",
+        "which product performs best",
+        "best performing products",
+        "best performing product",
+    ]
+
+    if any(phrase in q for phrase in vague_product_phrases):
+        return {
+            "question": question,
+            "prompt": "What would you like to compare?",
+            "options": {
+                "Highest total revenue":
+                    "Which five products generated the highest total revenue?",
+                "Most units sold":
+                    "Which five products sold the most units?",
+                "Lowest price":
+                    "Which five products have the lowest prices?",
+            },
+        }
+    vague_customer_phrases = [
+        "which customers are the best",
+        "who are the best customers",
+        "which customers are most valuable",
+        "best customers",
+        "top customers",
+    ]
+
+    if any(phrase in q for phrase in vague_customer_phrases):
+        return {
+            "question": question,
+            "prompt": "How would you like to rank customers?",
+            "options": {
+                "Highest spending":
+                    "Which five customers have spent the most money on orders?",
+                "Most orders":
+                    "Which five customers have placed the most orders?",
+                "Most recent signup":
+                    "Which five customers signed up most recently?",
+            },
+        }
+    
+    vague_sales_phrases = [
+        "tell me about sales",
+        "tell me about the sales",
+        "give me an overview of sales",
+        "give me a sales overview",
+        "how are sales doing",
+        "sales overview",
+    ]
+
+    if any(phrase in q for phrase in vague_sales_phrases):
+        return {
+            "question": question,
+            "prompt": "What would you like to know about sales?",
+            "options": {
+                "Total revenue":
+                    "What is the total revenue from all orders?",
+                "Sales by product":
+                    "Which five products generated the highest total revenue?",
+                "Sales over time":
+                    "How has total revenue changed over time, grouped by month?",
+            },
+        }
+
+    return None
+
+
+
+
 def summarize_results(question, sql, dataframe):
     """Create a concise answer using the exact database results."""
     if dataframe.empty:
@@ -258,7 +334,6 @@ def summarize_results(question, sql, dataframe):
         "product_name" in columns
         and "total_revenue" in columns
         and "total_units_sold" in columns
-        and len(dataframe) > 0
     ):
         row = dataframe.iloc[0]
         product = row["product_name"]
@@ -267,23 +342,67 @@ def summarize_results(question, sql, dataframe):
 
         return (
             f"{product} generated the highest total revenue, "
-            f"with {revenue:,.2f} in sales from {int(units)} units sold."
+            f"with €{float(revenue):,.2f} in sales from "
+            f"{int(units)} units sold."
         )
 
     # Single numeric result, such as an average or count
-    if len(dataframe.columns) == 1 and len(dataframe) == 1:
-        column = dataframe.columns[0]
+    if len(columns) == 1 and len(dataframe) == 1:
         value = dataframe.iloc[0, 0]
-        q = question.lower()
 
-        if "customer" in q and ("how many" in q or "count" in q):
+        if "customer" in question_lower and (
+            "how many" in question_lower or "count" in question_lower
+        ):
             return f"There are {int(value)} customers matching your criteria."
 
         return f"The result is {value}."
 
+    # Fast path: display straightforward list results without another LLM call
+    simple_list_columns = {
+        "name", "signup_date", "country", "category", "price",
+        "product_name", "customer_name", "order_date",
+        "total_amount", "total_revenue", "total_units_sold"
+    }
+
+    if columns and all(column in simple_list_columns for column in columns):
+        display_df = dataframe.head(50).copy()
+
+        # Expand country codes when a country column is present
+        country_names = {
+            "DE": "Germany",
+            "FI": "Finland",
+            "FR": "France",
+            "SE": "Sweden",
+            "UK": "United Kingdom",
+            "US": "United States",
+        }
+
+        if "country" in display_df.columns:
+            display_df["country"] = display_df["country"].map(
+                lambda value: country_names.get(value, value)
+            )
+
+        # Format the results as a readable list
+        lines = []
+        for _, row in display_df.iterrows():
+            parts = []
+            for column in display_df.columns:
+                value = row[column]
+                if column in ("price", "total_amount", "total_revenue"):
+                    try:
+                        value = f"€{float(value):,.2f}"
+                    except (ValueError, TypeError):
+                        pass
+                parts.append(f"{column.replace('_', ' ')}: {value}")
+            lines.append("- " + "; ".join(parts))
+
+        return f"Found {len(dataframe)} matching records:\n" + "\n".join(lines)
+
     # General fallback: use the model for other questions
     records = dataframe.head(50).to_dict(orient="records")
     prompt = f"""
+- Display all monetary amounts in euros (€) with two decimal places.
+  Do not convert or change the underlying numerical values.
 - When displaying country codes, use full country names where the
   mapping is known: DE = Germany, FI = Finland, FR = France,
   SE = Sweden, UK = United Kingdom, US = United States.
@@ -315,6 +434,7 @@ SQL results:
     return response["message"]["content"].strip()
 
 
+
 try:
     schema, table_names = get_schema()
     counts = get_row_counts(table_names)
@@ -327,11 +447,29 @@ cols = st.columns(len(table_names))
 for col, table in zip(cols, table_names):
     col.metric(table, f"{counts[table]:,} rows")
 
+
 question = st.text_input(
     "Ask a question about your database",
     placeholder="For example: Which 5 products have the highest total sales value?",
 )
-run_button = st.button("Ask the AI assistant", type="primary", disabled=not question.strip())
+
+clarification = get_clarification_options(question) if question.strip() else None
+
+if clarification:
+    st.info(clarification["prompt"])
+    selected_option = st.radio(
+        "Choose an interpretation",
+        options=list(clarification["options"].keys()),
+        key="clarification_choice",
+    )
+    run_button = st.button("Continue with selected option", type="primary")
+else:
+    selected_option = None
+    run_button = st.button(
+        "Ask the AI assistant",
+        type="primary",
+        disabled=not question.strip(),
+    )
 
 with st.expander("Database schema"):
     st.code(schema, language="text")
@@ -431,6 +569,8 @@ def validate_business_rules(sql, question):
 
 
 if run_button:
+    if clarification and selected_option:
+        question = clarification["options"][selected_option]
     total_start = time.perf_counter()
     scope_start = time.perf_counter()
     
